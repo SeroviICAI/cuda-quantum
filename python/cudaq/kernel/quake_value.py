@@ -1,15 +1,23 @@
 # ============================================================================ #
-# Copyright (c) 2022 - 2025 NVIDIA Corporation & Affiliates.                   #
+# Copyright (c) 2022 - 2024 NVIDIA Corporation & Affiliates.                   #
 # All rights reserved.                                                         #
 #                                                                              #
 # This source code and the accompanying materials are made available under     #
 # the terms of the Apache License 2.0 which accompanies this distribution.     #
 # ============================================================================ #
+from functools import partialmethod
+import inspect
+import sys
+import random
+import string
+import numpy as np
+import ctypes
 
-from cudaq.mlir._mlir_libs._quakeDialects import cudaq_runtime
-from cudaq.mlir.dialects import arith, quake, cc
-from cudaq.mlir.ir import (DenseI32ArrayAttr, F64Type, FloatAttr, Location,
-                           IntegerAttr, IntegerType)
+from ..mlir.ir import *
+from ..mlir.passmanager import *
+from ..mlir.dialects import quake, cc
+from ..mlir.dialects import builtin, func, arith
+from ..mlir._mlir_libs._quakeDialects import cudaq_runtime
 from .utils import mlirTypeFromPyType
 
 qvector = cudaq_runtime.qvector
@@ -59,7 +67,7 @@ class QuakeValue(object):
 
             if quake.VeqType.isinstance(type):
                 size = quake.VeqType.getSize(type)
-                if quake.VeqType.hasSpecifiedSize(type):
+                if size:
                     return size
                 return QuakeValue(
                     quake.VeqSizeOp(self.intType, self.mlirValue).result,
@@ -123,13 +131,66 @@ class QuakeValue(object):
             The underlying :class:`QuakeValue` must be a `list` or `veq`.
 
         Args:
-            start (int): The index to begin the slice from.
+            startIdx (int): The index to begin the slice from.
             count (int): The number of elements to extract after the `start` index.
         Returns:
             :class:`QuakeValue`: A new `QuakeValue` containing a slice of `self`
             from the `start` element to the `start + count` element.
         """
-        raise RuntimeError("QuakeValue.slice not implemented")
+        with self.ctx, Location.unknown(), self.pyKernel.insertPoint:
+            if count <= 0:
+                raise RuntimeError("QuakeValue.slice: 'count' must be >= 1.")
+
+            t = self.mlirValue.type
+            if not (cc.StdvecType.isinstance(t) or quake.VeqType.isinstance(t)):
+                raise RuntimeError("slice() only valid for stdvec or veq types.")
+
+            # If quake.veq => quake.SubVeqOp
+            if quake.VeqType.isinstance(t):
+                knownSize = quake.VeqType.getSize(t)
+                if knownSize and (startIdx + count) > knownSize:
+                    raise RuntimeError(
+                        f"Requested slice {startIdx}..{startIdx+count-1} out of veq size={knownSize}."
+                    )
+                subVeqTy = (quake.VeqType.get(self.ctx, count) 
+                            if knownSize else quake.VeqType.get(self.ctx))
+                i64Ty = IntegerType.get_signless(64)
+                lowerCst = arith.ConstantOp(i64Ty, IntegerAttr.get(i64Ty, startIdx)).result
+                upperVal = startIdx + count - 1
+                upperCst = arith.ConstantOp(i64Ty, IntegerAttr.get(i64Ty, upperVal)).result
+                subVeqOp = quake.SubVeqOp(
+                    subVeqTy,
+                    self.mlirValue,
+                    rawLower=startIdx,
+                    rawUpper=upperVal,
+                    lower=lowerCst,
+                    upper=upperCst
+                )
+                return QuakeValue(subVeqOp.result, self.pyKernel)
+
+            # If cc.stdvec => pointer-based approach
+            stdvecTy = t
+            eleTy = cc.StdvecType.getElementType(stdvecTy)
+            i64Ty = IntegerType.get_signless(64)
+
+            startCst = arith.ConstantOp(i64Ty, IntegerAttr.get(i64Ty, startIdx)).result
+            countCst = arith.ConstantOp(i64Ty, IntegerAttr.get(i64Ty, count)).result
+
+            arrTy = cc.ArrayType.get(self.ctx, eleTy)
+            arrPtrTy = cc.PointerType.get(self.ctx, arrTy)
+            dataPtrOp = cc.StdvecDataOp(arrPtrTy, self.mlirValue)
+            dataPtr   = dataPtrOp.result
+
+            elementPtrTy = cc.PointerType.get(self.ctx, eleTy)
+            computePtrOp = cc.ComputePtrOp(
+                elementPtrTy,
+                dataPtr,
+                [],
+                DenseI32ArrayAttr.get([startIdx], context=self.ctx)
+            )
+            slicePtr = computePtrOp.result
+            initOp = cc.StdvecInitOp(stdvecTy, slicePtr, countCst)
+            return QuakeValue(initOp.result, self.pyKernel)
 
     def __neg__(self):
         """
@@ -310,7 +371,12 @@ class QuakeValue(object):
 
     def __getitem__(self, idx):
         """
-        Return the element of `self` at the provided `index`.
+        Return the element(s) of `self` (:class:`QuakeValue`) at the given index or slice.
+
+        Note:
+            If a slice is passed, its step size must be 1, and open-ended slices
+            (e.g. `qubits[2:]` or `qubits[:5]`) are not currently supported. We also
+            do not support negative indices.
 
         Note:
 	        Only `list` or :class:`qvector` type :class:`QuakeValue`'s may be indexed.
@@ -324,41 +390,49 @@ class QuakeValue(object):
 	        RuntimeError: if `self` is a non-subscriptable :class:`QuakeValue`.
         """
         with self.ctx, Location.unknown(), self.pyKernel.insertPoint:
-            if cc.StdvecType.isinstance(self.mlirValue.type):
-                eleTy = cc.StdvecType.getElementType(self.mlirValue.type)
-                arrTy = cc.ArrayType.get(self.ctx, eleTy)
-                arrPtrTy = cc.PointerType.get(self.ctx, arrTy)
-                vecPtr = cc.StdvecDataOp(arrPtrTy, self.mlirValue).result
-                elePtrTy = cc.PointerType.get(self.ctx, eleTy)
-                eleAddr = None
-                i64Ty = IntegerType.get_signless(64)
-                if isinstance(idx, QuakeValue):
-                    eleAddr = cc.ComputePtrOp(
-                        elePtrTy, vecPtr, [idx.mlirValue],
-                        DenseI32ArrayAttr.get([-2147483648], context=self.ctx))
-                elif isinstance(idx, int):
+            # If it's an int
+            if isinstance(idx, int):
+                if cc.StdvecType.isinstance(self.mlirValue.type):
+                    eleTy = cc.StdvecType.getElementType(self.mlirValue.type)
+                    arrTy = cc.ArrayType.get(self.ctx, eleTy)
+                    arrPtrTy = cc.PointerType.get(self.ctx, arrTy)
+                    vecPtr = cc.StdvecDataOp(arrPtrTy, self.mlirValue).result
+                    elePtrTy = cc.PointerType.get(self.ctx, eleTy)
+                    # Record the extraction
                     self.knownUniqueExtractions.add(idx)
-                    eleAddr = cc.ComputePtrOp(
-                        elePtrTy, vecPtr, [],
-                        DenseI32ArrayAttr.get([idx], context=self.ctx))
-                loaded = cc.LoadOp(eleAddr.result)
-                return QuakeValue(loaded.result, self.pyKernel)
 
-            if quake.VeqType.isinstance(self.mlirValue.type):
-                processedIdx = None
-                if isinstance(idx, QuakeValue):
-                    processedIdx = idx.mlirValue
-                elif isinstance(idx, int):
+                    compute_ptr_op = cc.ComputePtrOp(
+                        elePtrTy, 
+                        vecPtr, 
+                        [],
+                        DenseI32ArrayAttr.get([idx], context=self.ctx))
+                    loaded = cc.LoadOp(compute_ptr_op.result)
+                    return QuakeValue(loaded.result, self.pyKernel)
+
+                if quake.VeqType.isinstance(self.mlirValue.type):
                     i64Ty = IntegerType.get_signless(64)
-                    processedIdx = arith.ConstantOp(i64Ty,
-                                                    IntegerAttr.get(i64Ty,
-                                                                    idx)).result
-                else:
-                    raise RuntimeError("invalid idx passed to QuakeValue.")
-                op = quake.ExtractRefOp(quake.RefType.get(self.ctx),
-                                        self.mlirValue,
-                                        -1,
-                                        index=processedIdx)
-                return QuakeValue(op.result, self.pyKernel)
+                    idxVal = arith.ConstantOp(i64Ty, IntegerAttr.get(i64Ty, idx)).result
+                    op = quake.ExtractRefOp(quake.RefType.get(self.ctx), 
+                                            self.mlirValue, -1, index=idxVal)
+                    return QuakeValue(op.result, self.pyKernel)
+
+                raise RuntimeError("Invalid integer indexing on non-subscriptable QuakeValue.")
+
+            # If it's a slice => half-open intervals
+            if isinstance(idx, slice):
+                start = 0 if (idx.start is None) else idx.start
+                stop  = idx.stop
+                step  = 1 if (idx.step is None) else idx.step
+
+                if stop is None:
+                    raise RuntimeError("Open-ended slices not supported.")
+                if step != 1:
+                    raise RuntimeError("No step != 1 support.")
+                if stop < start:
+                    raise RuntimeError("Invalid slice range.")
+                count = stop - start
+                if count <= 0:
+                    raise RuntimeError("Slice must have stop > start.")
+                return self.slice(start, count)
 
         raise RuntimeError("invalid getitem: ", idx)
